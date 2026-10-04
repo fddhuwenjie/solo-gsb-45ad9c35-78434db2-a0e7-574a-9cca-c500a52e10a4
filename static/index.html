@@ -52,6 +52,7 @@
       <option value="rewire">无中断改线演练演示</option>
       <option value="audit">命名审计演示（互斥名/别名环/无标签/串线）</option>
       <option value="isolation">串音隔离演示（贪心失败→回溯）</option>
+      <option value="redundancy">关键路由双通道演示（主备抗单点断路）</option>
     </select>
     <button class="primary" onclick="compute()">计算路由方案</button>
   </section>
@@ -211,6 +212,29 @@
       <span id="isolation-hint" class="hint"></span>
     </div>
     <div id="isolation-results"></div>
+  </section>
+
+  <section class="card" id="redundancy-card" hidden>
+    <h2>9. 关键路由双通道规划（主备抗单点断路）</h2>
+    <p class="hint">勾选<b>必须抗单点断路</b>的关键路由，并提交<b>最多允许新增的跳线数</b>。
+      系统沿现有设备、插孔对与全常态 / 半常态 / 直通语义，为<b>全部路由</b>联合选择一套
+      <b>可同时安装</b>的通路：每条关键路由得到<b>主通路</b>与<b>备用通路</b>两条链路，
+      两条通路不得共用会被拔断的跳线、被切断的常态或独占插孔——<b>半常态上插孔并送按最终占用
+      判定</b>（上插孔插线常态保持、信号并送；下插孔插线则转与常态互为热备，跳线被拔后常态
+      自动恢复）；非关键路由仍需在最终占用下保持可用。先满足全部路由，再最少新增跳线。
+      无解时返回<b>冲突断点、占用插孔与未满足路由</b>，<b>不提交部分方案</b>。</p>
+
+    <h3>关键路由勾选</h3>
+    <div id="redundancy-route-list" class="protect-list"></div>
+
+    <div class="drill-controls" style="margin-top:14px">
+      <label class="redundancy-budget">最多新增跳线数
+        <input type="number" id="redundancy-max-new" min="0" step="1" value="5" style="width:90px">
+      </label>
+      <button class="primary" onclick="runRedundancy()">🧯 计算主备双通道方案</button>
+      <span id="redundancy-hint" class="hint"></span>
+    </div>
+    <div id="redundancy-results"></div>
   </section>
 </main>
 

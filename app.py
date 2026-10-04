@@ -5,6 +5,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from audit import audit_signals
 from isolation import IsolationConflict, IsolationError, plan_isolation
 from layout import solve_layout
+from redundancy import (RedundancyConflict, RedundancyError, plan_redundancy)
 from rewire import RewireError, SeamlessConflict, seamless_rewire
 from solver import (EXAMPLES, ConfigError, FaultTargetError,
                     fault_assessment, solve)
@@ -146,6 +147,35 @@ def seamless_rewire_drill():
         # 不存在保持保护路由连续通声的顺序：结构化阻塞原因（不产生步骤）
         return _structured_error(exc, 409)
     except RewireError as exc:
+        return _structured_error(exc, 400)
+    except ConfigError as exc:
+        return _structured_error(exc, 400)
+    return jsonify(result)
+
+
+@app.post("/api/redundancy")
+def redundancy():
+    """关键路由双通道规划：勾选必须抗单点断路的路由 + 最多新增跳线数，
+    为全部路由联合选择可同时安装的主通路与备用通路。"""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "请求体必须是 JSON 对象"}}), 400
+    config = body.get("config")
+    if not isinstance(config, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "缺少 config 配置对象"}}), 400
+    redundancy_req = body.get("redundancy")
+    if not isinstance(redundancy_req, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "缺少 redundancy 对象 "
+                                                          "{criticalRoutes, maxNewCables}"}}), 400
+    try:
+        result = plan_redundancy(config, redundancy_req)
+    except RedundancyConflict as exc:
+        # 穷尽搜索仍无法为主备双通道找到不共用断点的联合安装方案
+        return _structured_error(exc, 409)
+    except RedundancyError as exc:
         return _structured_error(exc, 400)
     except ConfigError as exc:
         return _structured_error(exc, 400)

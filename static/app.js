@@ -5,6 +5,9 @@ const state = { devices: [], pairs: [], routes: [], zones: [] };
 const isolationState = { groups: [], forbidden: [] };
 let lastIsolationData = null;
 let activeIsolationConflict = null;
+// 关键路由双通道规划：勾选的路由序号集合 + 最多新增跳线数
+const redundancyState = { critical: new Set(), maxNew: 5 };
+let lastRedundancyData = null;
 // 信号命名审计名签（按目标身份 key 存）：{ports:{ "DEV.port": {name,alias}}, pairs:{id:...}, cables:{id:...}, routes:{idx:...}}
 const auditLabels = { ports: {}, pairs: {}, cables: {}, routes: {} };
 let lastPlanData = null;
@@ -121,6 +124,8 @@ async function loadExample(name) {
   loadAuditLabelsFromExample(cfg.labels);
   // 示例可自带串音隔离声明（隔离模块使用）
   loadIsolationFromExample(cfg.isolation, cfg.routes.length);
+  // 示例可自带双通道声明（关键路由双通道规划使用）
+  loadRedundancyFromExample(cfg.redundancy, cfg.routes.length);
   renderAll();
   renderZones();
   $("#results").innerHTML = "";
@@ -134,10 +139,13 @@ async function loadExample(name) {
   $("#rewire-results").innerHTML = "";
   $("#isolation-card").hidden = true;
   $("#isolation-results").innerHTML = "";
+  $("#redundancy-card").hidden = true;
+  $("#redundancy-results").innerHTML = "";
   rewireState.targetRoutes = [];
   rewireState.protected = new Set();
   lastRewireData = null;
   lastIsolationData = null;
+  lastRedundancyData = null;
   lastPlanData = null;
   lastAuditData = null;
 }
@@ -172,6 +180,7 @@ async function compute() {
   renderAuditPanel(data, ok);
   renderRewirePanel(data, ok);
   renderIsolationPanel(data, ok);
+  renderRedundancyPanel(data, ok);
   $("#results").scrollIntoView({ behavior: "smooth" });
 }
 
@@ -2113,6 +2122,425 @@ function isolationTopologySvg(data, variant) {
   // 分量图例（右下角列出各组 → 分量）
   s += `<text x="20" y="${height - 12}" fill="#9aa4b2" font-size="11">插孔描边色＝隔离组；底色＝物理分量。` +
     (iss ? " 黄色粗线＝最短共享证据，红色描边＝冲突端点。" : "") + `</text>`;
+  s += `</svg>`;
+  return s;
+}
+
+/* ---------------- 关键路由双通道规划 ---------------- */
+
+const RED_PRIMARY = "#4da3ff";
+const RED_BACKUP = "#ff9f43";
+const RED_SINGLE = "#8d96a3";
+const redRoleColor = (role) => role === "primary" ? RED_PRIMARY
+  : role === "backup" ? RED_BACKUP : RED_SINGLE;
+const redRoleLabel = (role) => role === "primary" ? "主通路"
+  : role === "backup" ? "备用通路" : "通路";
+
+function loadRedundancyFromExample(red, nRoutes) {
+  redundancyState.critical = new Set();
+  redundancyState.maxNew = 5;
+  if (!red || typeof red !== "object") return;
+  if (Array.isArray(red.criticalRoutes)) {
+    red.criticalRoutes.forEach((i) => {
+      if (Number.isInteger(i) && i >= 0 && i < nRoutes) {
+        redundancyState.critical.add(i);
+      }
+    });
+  }
+  if (Number.isInteger(red.maxNewCables) && red.maxNewCables >= 0) {
+    redundancyState.maxNew = red.maxNewCables;
+  }
+}
+
+function renderRedundancyPanel(data, httpOk) {
+  const card = $("#redundancy-card");
+  if (!httpOk || !data || data.error || !Array.isArray(data.pairs)) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  for (const i of [...redundancyState.critical]) {
+    if (i >= state.routes.length) redundancyState.critical.delete(i);
+  }
+  renderRedundancyRouteList(data);
+  const inp = $("#redundancy-max-new");
+  if (document.activeElement !== inp) inp.value = String(redundancyState.maxNew);
+  $("#redundancy-hint").textContent =
+    `基线规划安装 ${data.cables.length} 根跳线；勾选关键路由并设定新增跳线上限后联合搜索主备通路。`;
+  lastRedundancyData = null;
+  $("#redundancy-results").innerHTML = "";
+}
+
+function renderRedundancyRouteList(data) {
+  const el = $("#redundancy-route-list");
+  if (!state.routes.length) {
+    el.innerHTML = `<p class="hint">当前没有路由。</p>`;
+    return;
+  }
+  el.innerHTML = state.routes.map((r, i) => {
+    const planned = data.routes[i];
+    const bad = !planned || planned.status !== "ok";
+    return `<label class="protect-row${bad ? " bad" : ""}">
+      <input type="checkbox" ${redundancyState.critical.has(i) ? "checked" : ""}
+        onchange="toggleRedundancyCritical(${i}, this.checked)" ${bad ? "disabled" : ""}>
+      <span class="protect-no">路由 ${i + 1}</span>
+      <span class="hint">${esc(r.source)} → ${esc(r.target)}</span>
+      ${bad ? '<span class="tag bad">基线无解，不可选</span>'
+           : (redundancyState.critical.has(i) ? '<span class="tag ok">关键 · 主备双通道</span>' : "")}
+    </label>`;
+  }).join("");
+}
+
+function toggleRedundancyCritical(i, on) {
+  if (on) redundancyState.critical.add(i);
+  else redundancyState.critical.delete(i);
+  if (lastPlanData) renderRedundancyRouteList(lastPlanData);
+}
+
+async function runRedundancy() {
+  const out = $("#redundancy-results");
+  if (!lastConfig) {
+    out.innerHTML = `<div class="banner warn">请先计算一次路由方案。</div>`;
+    return;
+  }
+  const maxNew = Number($("#redundancy-max-new").value);
+  if (!Number.isInteger(maxNew) || maxNew < 0) {
+    out.innerHTML = `<div class="banner err">最多新增跳线数必须是非负整数。</div>`;
+    return;
+  }
+  redundancyState.maxNew = maxNew;
+  if (!redundancyState.critical.size) {
+    out.innerHTML = `<div class="banner warn">请至少勾选一条必须抗单点断路的关键路由。</div>`;
+    return;
+  }
+  out.innerHTML = `<div class="banner">⏳ 正在为全部路由联合搜索可同时安装的主备双通道（先可满足、后最少跳线）…</div>`;
+  let data, status;
+  try {
+    const res = await fetch("/api/redundancy", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config: lastConfig,
+        redundancy: {
+          criticalRoutes: [...redundancyState.critical].sort((a, b) => a - b),
+          maxNewCables: maxNew,
+        },
+      }),
+    });
+    data = await res.json();
+    status = res.status;
+  } catch (e) {
+    out.innerHTML = `<div class="banner err">无法连接后端：${esc(e.message)}</div>`;
+    return;
+  }
+  lastRedundancyData = data;
+  if (status === 400) {
+    out.innerHTML = `<div class="banner err">双通道配置错误：${esc(errorMessage(data))}</div>`;
+    return;
+  }
+  if (status === 409) renderRedundancyConflict(data);
+  else renderRedundancySuccess(data);
+}
+
+function standbyTag(seg) {
+  const n = (seg.standbyNormals || []).length;
+  if (!n) return "";
+  return `<span class="tag warn" title="这些常态在最终占用下处于热备（跳线拔出后自动恢复）">热备常态 ${n}</span>`;
+}
+
+function aliveTag(alive, label) {
+  return alive
+    ? `<span class="tag ok">${label} · 当前通声</span>`
+    : `<span class="tag warn" title="另一条通路正在服役；本链路在其断点发生时自动接管">${label} · 热备待用</span>`;
+}
+
+function renderRedundancySuccess(data) {
+  let html = `<div class="banner ok">✅ 主备双通道方案已生成：全部路由均可满足，
+    共安装 <b>${data.cableCount}</b> 根跳线（基线 ${data.baselineCableCount} 根，
+    新增 <b>${data.extraCableCount}</b> 根，预算上限 ${data.maxNewCables}）。
+    逐点仿真确认：每个单点断点（跳线被拔 / 常态被切断）后，
+    <b>${data.failurePreview.allCriticalSurvive ? "全部关键路由均至少有一条通路幸存"
+      : "存在关键路由失去双通道保护（见故障预览）"}</b>。</div>`;
+  if (data.redundancy.solverNote) {
+    html += `<div class="banner warn">⚠️ ${esc(data.redundancy.solverNote)}</div>`;
+  }
+  if (data.feedbackLoops.length) {
+    html += `<div class="banner warn">⚠️ 检测到 ${data.feedbackLoops.length} 个反馈环路（保留检测、仅警告）：<ul class="loop-list">` +
+      data.feedbackLoops.map((l) => `<li>${l.map(esc).join(" → ")}</li>`).join("") + `</ul></div>`;
+  }
+
+  html += `<div class="audit-stat-row">
+    <span class="audit-stat"><b>${data.criticalRoutes.length}</b>关键路由</span>
+    <span class="audit-stat ok"><b>${data.cableCount}</b>跳线总数</span>
+    <span class="audit-stat"><b>${data.baselineCableCount}</b>基线跳线</span>
+    <span class="audit-stat ok"><b>${data.extraCableCount}</b>新增跳线</span>
+    <span class="audit-stat"><b>${data.redundancy.searchNodes}</b>搜索节点</span>
+  </div>`;
+
+  if (data.steps.length) {
+    html += `<div class="result-card"><h3>接线顺序（主备跳线同时安装）</h3><ol class="steps">` +
+      data.steps.map((s) => `<li>${esc(s)}</li>`).join("") + `</ol></div>`;
+  }
+  if (data.notes.length) {
+    html += `<div class="result-card"><h3>插头对常态连接的影响（并送 / 热备 / 断开）</h3>
+      <ul class="notes">` + data.notes.map((n) => `<li>${esc(n)}</li>`).join("") + `</ul></div>`;
+  }
+
+  html += `<div class="result-card"><h3>主备逐段链路</h3>` + data.routes.map((r) => {
+    if (r.critical) {
+      return `<div class="route-block">
+        <div class="route-title">关键路由 ${r.index + 1}：${esc(r.source)} → ${esc(r.target)}
+          <span class="tag ok">主备双通道 · ${r.cableCount} 根跳线</span></div>
+        <div class="red-seg-head" style="color:${RED_PRIMARY}">主通路（#${r.primary.cables.join("、#") || "无跳线"}）
+          ${aliveTag(r.primary.alive, "主")}${standbyTag(r.primary)}</div>
+        ${chainHtml(r.primary.chain)}
+        <div class="red-seg-head" style="color:${RED_BACKUP}">备用通路（#${r.backup.cables.join("、#") || "无跳线"}）
+          ${aliveTag(r.backup.alive, "备")}${standbyTag(r.backup)}</div>
+        ${chainHtml(r.backup.chain)}
+      </div>`;
+    }
+    return `<div class="route-block">
+      <div class="route-title">路由 ${r.index + 1}：${esc(r.source)} → ${esc(r.target)}
+        <span class="tag ${r.path.alive ? "ok" : "bad"}">非关键 · ${r.cableCount} 根跳线 ·
+        ${r.path.alive ? "最终占用下可用" : "失声"}</span></div>
+      ${chainHtml(r.path.chain)}
+    </div>`;
+  }).join("") + `</div>`;
+
+  // 占用
+  html += `<div class="result-card"><h3>最终占用</h3>
+    <div class="rewire-detail-cols">
+      <div><h4>独占插孔（每孔一根跳线，主备/各路由联合占用）</h4>
+      ${data.occupancy.jacks.length ? `<table class="grid"><thead><tr><th>插孔</th><th>背板端口</th><th>跳线</th></tr></thead><tbody>` +
+        data.occupancy.jacks.map((j) => `<tr><td><b>${esc(j.jack)}</b></td>
+          <td>${esc(j.port || "—")}</td><td>#${j.cableId}</td></tr>`).join("") +
+        `</tbody></table>` : `<p class="hint">无跳线插孔占用。</p>`}</div>
+      <div><h4>常态连接（按最终插头占用判定）</h4>
+      <table class="grid"><thead><tr><th>插孔对</th><th>最终状态</th><th>使用通路</th></tr></thead><tbody>` +
+        data.occupancy.normals.map((n) => `<tr>
+          <td>第 ${n.pairId} 对 · ${esc(n.modeLabel)}<br>
+            <span class="hint">${esc(n.topPort || "—")} → ${esc(n.bottomPort || "—")}</span></td>
+          <td>${n.active ? '<span class="tag ok">生效</span>' : '<span class="tag warn">热备/被插头断开</span>'}</td>
+          <td>${n.users.map((u) => `<span class="tag" style="background:rgba(77,163,255,.15);color:${redRoleColor(u.role)}">
+            路由${u.route + 1} · ${redRoleLabel(u.role)}</span>`).join(" ")}</td>
+        </tr>`).join("") + `</tbody></table></div>
+    </div></div>`;
+
+  html += `<div class="result-card"><h3>主备双通道拓扑</h3>
+    <div class="audit-svg-wrap">${redundancyTopologySvg(data)}</div>
+    <div class="legend">
+      <span class="swatch" style="background:${RED_PRIMARY};border-color:${RED_PRIMARY}"></span>主通路跳线
+      <span class="swatch" style="background:${RED_BACKUP};border-color:${RED_BACKUP}"></span>备用通路跳线
+      <span class="swatch" style="background:#8d96a3;border-color:#8d96a3"></span>非关键路由跳线
+      <span class="swatch" style="background:#3ecf8e;border-color:#3ecf8e"></span>生效常态；灰常态＝最终占用下热备/断开；
+      <b style="color:var(--yellow)">「并」</b>＝半常态上插孔插线并送点，<b style="color:var(--yellow)">「热」</b>＝热备端点
+    </div></div>`;
+
+  html += renderRedundancyFailures(data);
+  $("#redundancy-results").innerHTML = html;
+}
+
+function renderRedundancyFailures(data) {
+  const fp = data.failurePreview;
+  const rows = fp.breaks.map((f, i) => {
+    const critLost = f.criticalLost.length;
+    const nonLost = f.nonCriticalLost.length;
+    const nonTotal = f.routes.filter((r) => !r.critical).length;
+    const tag = critLost
+      ? '<span class="tag bad">关键路由失保护</span>'
+      : '<span class="tag ok">关键路由全部幸存</span>';
+    return `<button class="rewire-step warn" id="red-break-btn-${i}" onclick="selectRedundancyBreak(${i})">
+      <span class="step-no">${f.type === "cable" ? `跳线 #${f.id}` : `第 ${f.id} 对常态`}</span>
+      <span class="step-title">${f.type === "cable" ? "拔断跳线" : "切断常态"}</span>
+      <span class="step-prot">${tag}
+        ${nonLost ? `<span class="prot-chip off">非关键失声 ${nonLost}</span>`
+                  : `<span class="prot-chip on">非关键保持 ${nonTotal}</span>`}
+      </span>
+    </button>`;
+  }).join("");
+  return `<div class="result-card"><h3>逐一断点故障预览（点击查看该断点后的幸存通路）</h3>
+    <p class="hint">枚举全部已安装跳线（被拔）与最终生效常态（被切断）。拔跳线会释放插孔，
+      全 / 半常态可能因此自动恢复——这正是热备接管的时刻。</p>
+    <div class="rewire-steps">${rows}</div>
+    <div id="red-break-detail"></div></div>`;
+}
+
+function selectRedundancyBreak(i) {
+  const data = lastRedundancyData;
+  const f = data.failurePreview.breaks[i];
+  if (!f) return;
+  document.querySelectorAll("#redundancy-results .rewire-step").forEach((b, k) =>
+    b.classList.toggle("active", k === i));
+  const routeRows = f.routes.map((r) => {
+    if (r.critical) {
+      const p = r.primaryAlive ? '<span class="tag ok">主通路幸存 ✓</span>'
+        : '<span class="tag bad">主通路中断</span>';
+      const b = r.backupAlive ? '<span class="tag ok">备用通路幸存 ✓</span>'
+        : '<span class="tag bad">备用通路中断</span>';
+      return `<div class="route-block">
+        <div class="route-title">关键路由 ${r.index + 1} ${p} ${b}
+          ${r.serviceLost ? '<span class="tag bad">服务中断 ✗</span>'
+                           : '<span class="tag ok">至少一条幸存，服务保持 ✓</span>'}</div>
+      </div>`;
+    }
+    return `<div class="route-block">
+      <div class="route-title">非关键路由 ${r.index + 1}
+        ${r.pathAlive ? '<span class="tag ok">保持可用 ✓</span>'
+                      : '<span class="tag warn">失声（非关键，不做保护承诺）</span>'}</div>
+    </div>`;
+  }).join("");
+  $("#red-break-detail").innerHTML = `
+    <div class="step-detail-head"><b>断点：</b>${esc(f.label)}</div>
+    <div class="conflict-ports">断点端口：${portsText(f.ports)}</div>
+    ${routeRows}`;
+}
+
+function renderRedundancyConflict(data) {
+  let html;
+  if (data.baselineInvalid) {
+    html = `<div class="banner err">❌ 基线规划本身存在无法路由的请求：必须先让全部路由可通，
+      才能为关键路由规划主备双通道。<b>不提交部分方案。</b></div>`;
+  } else if (data.inconclusive) {
+    html = `<div class="banner warn">⚠️ 搜索达到节点 / 枚举深度上限，结论为 <b>inconclusive</b>：
+      已列出搜索中发现的冲突断点与占用插孔，但未证明绝对无解。<b>未提交任何部分方案。</b></div>`;
+  } else if (data.budgetLimited) {
+    html = `<div class="banner err">❌ 在「最多新增 ${data.maxNewCables} 根跳线」的预算下无解：
+      放宽预算后存在可行的主备双通道方案。<b>本次不提交部分方案。</b></div>`;
+  } else {
+    html = `<div class="banner err">❌ 不存在满足全部关键路由单点断路保护的双通道联合规划：
+      有关键路由的备用通路被迫与主路共用断点（跳线 / 常态 / 独占插孔）。
+      返回冲突断点、占用插孔与未满足路由，<b>不提交部分方案</b>。</div>`;
+  }
+  if (data.solverNote) html += `<div class="banner warn">⚠️ ${esc(data.solverNote)}</div>`;
+  html += `<div class="audit-stat-row">
+    <span class="audit-stat err"><b>${(data.conflicts || []).length}</b>主备冲突路由</span>
+    <span class="audit-stat warn"><b>${(data.unsatisfiedRoutes || []).length}</b>未满足路由</span>
+    <span class="audit-stat"><b>${data.baselineCableCount}</b>基线跳线</span>
+    <span class="audit-stat"><b>${data.searchNodes}</b>搜索节点</span>
+  </div>`;
+
+  if ((data.conflicts || []).length) {
+    html += `<div class="result-card"><h3>冲突断点（备用通路被迫与主路共用）</h3>` +
+      data.conflicts.map((c) => `<div class="issue-card severity-error">
+        <div class="issue-head"><b>路由 ${c.route + 1}</b>
+          <span class="hint">${esc(c.source)} → ${esc(c.target)}</span>
+          <span class="tag bad">${c.status === "no-redundant-path" ? "无独立备用通路" : "冲突"}</span></div>
+        <ul class="conflict-reasons">${c.blockers.map((b) => `<li>${esc(b.label)}</li>`).join("")}</ul>
+        ${c.occupiedReasons && c.occupiedReasons.length
+          ? `<div class="issue-sub">联合占用下的额外阻塞：<ul class="conflict-reasons">` +
+            c.occupiedReasons.map((x) => `<li>${esc(x)}</li>`).join("") + `</ul></div>` : ""}
+        <div class="issue-sub">主通路：</div>
+        <div class="evidence-box">${chainHtml(c.primaryChain)}</div>
+        ${c.witness ? `<div class="issue-sub">冲突最少的备用理想路径（见证，#9001 为未安装候选跳线）：</div>
+          <div class="evidence-box">${chainHtml(c.witness)}</div>` : ""}
+      </div>`).join("") + `</div>`;
+  }
+
+  html += `<div class="result-card"><h3>未满足路由（不提交部分方案）</h3>` +
+    (data.unsatisfiedRoutes || []).map((u) => `<div class="route-block">
+      <div class="route-title">${u.critical ? "关键" : "非关键"}路由 ${u.index + 1}：${esc(u.source)} → ${esc(u.target)}
+        <span class="tag bad">${u.role === "backup" ? "备用通路" : u.role === "primary" ? "主通路" : "通路"} · ${esc(u.status)}</span></div>
+      <ul class="conflict-reasons">${(u.reasons || []).map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      ${u.ports && u.ports.length ? `<div class="conflict-ports">冲突端口：` +
+        u.ports.map((p) => `${esc(p.jack)}（${esc(p.port || "?")}）`).join("、") + `</div>` : ""}
+    </div>`).join("") + `</div>`;
+
+  html += `<div class="result-card"><h3>占用插孔与终止状态跳线（仅分析，非可施工方案）</h3>
+    ${(data.occupiedJacks || []).length ? `<table class="grid"><thead><tr><th>插孔</th><th>背板端口</th><th>跳线</th></tr></thead><tbody>` +
+      data.occupiedJacks.map((j) => `<tr><td><b>${esc(j.jack)}</b></td>
+        <td>${esc(j.port || "—")}</td><td>#${j.cableId}</td></tr>`).join("") +
+      `</tbody></table>` : `<p class="hint">终止状态无跳线插孔占用。</p>`}</div>`;
+
+  if (data.baseline) {
+    html += `<div class="result-card"><h3>输入顺序基线（${data.baseline.cableCount} 根跳线）</h3>
+      ${panelSvg(data.baseline.pairs, data.baseline.cables)}</div>`;
+  }
+  $("#redundancy-results").innerHTML = html;
+}
+
+/* ---- 主备双通道拓扑 SVG ---- */
+
+function redundancyTopologySvg(data) {
+  const pairs = data.pairs;
+  if (!pairs.length) return "";
+  const cables = data.cables;
+  const colW = 100, x0 = 64, topY = 70, botY = 140, height = 330;
+  const width = x0 * 2 + colW * (pairs.length - 1);
+  const pos = {};
+  pairs.forEach((p, i) => {
+    pos[p.topJack] = { x: x0 + i * colW, y: topY };
+    pos[p.bottomJack] = { x: x0 + i * colW, y: botY };
+  });
+  const ownerByJack = {};
+  cables.forEach((c) => {
+    ownerByJack[c.fromJack] = c;
+    ownerByJack[c.toJack] = c;
+  });
+  // 热备端点：其常态被通路使用但最终不生效的插孔对；
+  // 并送点：半常态、上插孔插线且常态最终仍生效、且有通路使用该常态
+  const standbyPairs = new Set();
+  const multPairs = new Set();
+  for (const n of (data.occupancy.normals || [])) {
+    if (!n.active) {
+      standbyPairs.add(n.pairId);
+    } else if (n.mode === "half" && ownerByJack[`${n.pairId}T`]) {
+      multPairs.add(n.pairId);
+    }
+  }
+
+  let s = `<svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
+  s += `<rect x="8" y="32" width="${width - 16}" height="150" rx="10" fill="#12151a" stroke="#2e3542"/>`;
+  s += `<text x="20" y="24" fill="#9aa4b2" font-size="12">关键路由主备双通道拓扑（蓝＝主 · 橙＝备 · 灰＝非关键）</text>`;
+
+  for (const p of pairs) {
+    if (p.mode === "through" || !p.topPort || !p.bottomPort) continue;
+    const t = pos[p.topJack], b = pos[p.bottomJack];
+    const standby = standbyPairs.has(p.id);
+    const col = p.normalActive ? "#3ecf8e" : standby ? "#ffcf5c" : "#5a6270";
+    s += `<line x1="${t.x - 18}" y1="${t.y}" x2="${b.x - 18}" y2="${b.y}"
+      stroke="${col}" stroke-width="${standby ? 4 : 3}"
+      ${standby ? 'stroke-dasharray="7,4"' : ""} opacity="${p.normalActive ? .95 : .6}"/>`;
+  }
+
+  cables.forEach((c) => {
+    const a = pos[c.fromJack], b = pos[c.toJack];
+    if (!a || !b) return;
+    const color = redRoleColor(c.role);
+    const depth = 60 + Math.abs(a.x - b.x) * 0.3;
+    const mx = (a.x + b.x) / 2, my = botY + depth;
+    s += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none"
+      stroke="${color}" stroke-width="3.5" opacity="0.95"/>`;
+    s += `<text x="${mx}" y="${my * 0.62}" fill="${color}" font-size="12"
+      text-anchor="middle" font-weight="bold">#${c.id}·${c.role === "primary" ? "主"
+        : c.role === "backup" ? "备" : ""}${c.routeIndex + 1}</text>`;
+  });
+
+  for (const p of pairs) {
+    for (const [jack, port, dy] of [[p.topJack, p.topPort, -15], [p.bottomJack, p.bottomPort, 26]]) {
+      if (!pos[jack]) continue;
+      const { x, y } = pos[jack];
+      const owner = ownerByJack[jack];
+      const fill = owner ? redRoleColor(owner.role) : "#1d222b";
+      s += `<circle cx="${x}" cy="${y}" r="9" fill="${fill}" stroke="#9aa4b2" stroke-width="1.5"/>`;
+      s += `<text x="${x}" y="${y + dy}" fill="#9aa4b2" font-size="10"
+        text-anchor="middle">${esc(port || "—")}</text>`;
+      s += `<text x="${x + 14}" y="${y + 4}" fill="#e6e9ef" font-size="10">${esc(jack)}</text>`;
+    }
+    if (multPairs.has(p.id)) {
+      s += `<g><circle cx="${pos[p.topJack].x + 13}" cy="${pos[p.topJack].y - 12}" r="7"
+           fill="#ffcf5c" stroke="#5a4a10"/><text x="${pos[p.topJack].x + 13}"
+           y="${pos[p.topJack].y - 8}" fill="#2a2100" font-size="9"
+           text-anchor="middle" font-weight="bold">并</text></g>`;
+    }
+    if (standbyPairs.has(p.id)) {
+      s += `<g><circle cx="${pos[p.bottomJack].x - 13}" cy="${pos[p.bottomJack].y + 14}" r="7"
+           fill="#ffcf5c" stroke="#5a4a10"/><text x="${pos[p.bottomJack].x - 13}"
+           y="${pos[p.bottomJack].y + 18}" fill="#2a2100" font-size="9"
+           text-anchor="middle" font-weight="bold">热</text></g>`;
+    }
+    s += `<text x="${pos[p.topJack].x}" y="${botY + 42}" fill="#9aa4b2" font-size="10"
+      text-anchor="middle">第${p.id}对 · ${esc(p.modeLabel)}</text>`;
+  }
   s += `</svg>`;
   return s;
 }

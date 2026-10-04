@@ -930,4 +930,41 @@ EXAMPLES = {
             },
         },
     },
+    "redundancy": {
+        "label": "关键路由双通道演示（主备抗单点断路）",
+        "config": {
+            "devices": [
+                # 主唱链路：SRC → A → B → SP → DST（四对常态，0 跳线）
+                {"name": "SRC", "inputs": [], "outputs": ["out"]},
+                {"name": "A", "inputs": ["in"], "outputs": ["out"]},
+                {"name": "B", "inputs": ["in"], "outputs": ["out"]},
+                {"name": "SP", "inputs": ["in"], "outputs": ["out"]},
+                {"name": "DST", "inputs": ["in"], "outputs": []},
+                # 对讲链路：AUX → Y → R
+                {"name": "AUX", "inputs": [], "outputs": ["out"]},
+                {"name": "Y", "inputs": ["in"], "outputs": ["out"]},
+                {"name": "R", "inputs": ["in"], "outputs": []},
+                # 非关键监听
+                {"name": "MIC", "inputs": [], "outputs": ["out"]},
+                {"name": "MON", "inputs": ["in"], "outputs": []},
+            ],
+            "pairs": [
+                {"id": 1, "top": "SRC.out", "bottom": "A.in", "mode": "half"},
+                {"id": 2, "top": "A.out", "bottom": "B.in", "mode": "half"},
+                {"id": 3, "top": "B.out", "bottom": "SP.in", "mode": "half"},
+                {"id": 4, "top": "SP.out", "bottom": "DST.in", "mode": "full"},
+                {"id": 7, "top": "AUX.out", "bottom": "Y.in", "mode": "half"},
+                {"id": 8, "top": "Y.out", "bottom": "R.in", "mode": "full"},
+                {"id": 9, "top": "MIC.out", "bottom": "MON.in", "mode": "through"},
+            ],
+            "routes": [
+                {"source": "SRC.out", "target": "DST.in"},
+                {"source": "AUX.out", "target": "R.in"},
+                {"source": "MIC.out", "target": "MON.in"},
+            ],
+            # 随示例一起载入的双通道声明（parse_config 忽略未知键，
+            # /api/redundancy 才使用）：前两条为主备关键路由
+            "redundancy": {"criticalRoutes": [0, 1], "maxNewCables": 5},
+        },
+    },
 }

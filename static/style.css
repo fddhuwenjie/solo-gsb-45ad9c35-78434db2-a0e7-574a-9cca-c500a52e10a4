@@ -240,3 +240,14 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px
 }
 .group-overview-row:last-child { border-bottom: none; }
 #isolation-results { margin-top: 16px; }
+
+/* ---------------- 关键路由双通道规划 ---------------- */
+.redundancy-budget {
+  display: flex; align-items: center; gap: 8px; font-size: 14px;
+  color: var(--muted); white-space: nowrap;
+}
+.redundancy-budget input { width: 90px; }
+.red-seg-head { font-size: 13.5px; font-weight: 600; margin: 8px 0 2px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+#redundancy-results { margin-top: 16px; }
+#redundancy-results .rewire-step.warn { border-left-color: var(--accent); }
+#redundancy-results .rewire-step.active { outline: 2px solid var(--accent); }
