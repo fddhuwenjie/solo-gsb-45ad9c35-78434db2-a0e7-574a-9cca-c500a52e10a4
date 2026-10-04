@@ -121,6 +121,8 @@ async function loadExample(name) {
   loadAuditLabelsFromExample(cfg.labels);
   // 示例可自带串音隔离声明（隔离模块使用）
   loadIsolationFromExample(cfg.isolation, cfg.routes.length);
+  // 示例可自带关键路由双通道声明（双通道模块使用）
+  loadDualFromExample(cfg.redundancy, cfg.routes.length);
   renderAll();
   renderZones();
   $("#results").innerHTML = "";
@@ -134,10 +136,13 @@ async function loadExample(name) {
   $("#rewire-results").innerHTML = "";
   $("#isolation-card").hidden = true;
   $("#isolation-results").innerHTML = "";
+  $("#dual-card").hidden = true;
+  $("#dual-results").innerHTML = "";
   rewireState.targetRoutes = [];
   rewireState.protected = new Set();
   lastRewireData = null;
   lastIsolationData = null;
+  lastDualData = null;
   lastPlanData = null;
   lastAuditData = null;
 }
@@ -172,6 +177,7 @@ async function compute() {
   renderAuditPanel(data, ok);
   renderRewirePanel(data, ok);
   renderIsolationPanel(data, ok);
+  renderDualPanel(data, ok);
   $("#results").scrollIntoView({ behavior: "smooth" });
 }
 
@@ -2113,6 +2119,428 @@ function isolationTopologySvg(data, variant) {
   // 分量图例（右下角列出各组 → 分量）
   s += `<text x="20" y="${height - 12}" fill="#9aa4b2" font-size="11">插孔描边色＝隔离组；底色＝物理分量。` +
     (iss ? " 黄色粗线＝最短共享证据，红色描边＝冲突端点。" : "") + `</text>`;
+  s += `</svg>`;
+  return s;
+}
+
+/* ---------------- 关键路由双通道规划 ---------------- */
+
+const dualState = { critical: new Set(), maxNew: 4 };
+let lastDualData = null;
+let activeDualBreak = null;
+
+function loadDualFromExample(red, nRoutes) {
+  dualState.critical = new Set();
+  dualState.maxNew = 4;
+  if (!red || typeof red !== "object") return;
+  if (Array.isArray(red.criticalRoutes)) {
+    red.criticalRoutes.forEach((i) => {
+      if (Number.isInteger(i) && i >= 0 && i < nRoutes) dualState.critical.add(i);
+    });
+  }
+  if (Number.isInteger(red.maxNewCables)) dualState.maxNew = red.maxNewCables;
+}
+
+function renderDualPanel(data, httpOk) {
+  const card = $("#dual-card");
+  if (!httpOk || !data || data.error || !Array.isArray(data.pairs)) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  for (const i of [...dualState.critical]) {
+    if (i >= state.routes.length) dualState.critical.delete(i);
+  }
+  $("#dual-route-list").innerHTML = state.routes.map((r, i) => {
+    const planned = data.routes[i];
+    const bad = !planned || planned.status !== "ok";
+    return `<label class="protect-row${bad ? " bad" : ""}">
+      <input type="checkbox" ${dualState.critical.has(i) ? "checked" : ""}
+        onchange="toggleDualCritical(${i}, this.checked)" ${bad ? "disabled" : ""}>
+      <span class="protect-no">路由 ${i + 1}</span>
+      <span class="hint">${esc(r.source || "—")} → ${esc(r.target || "—")}</span>
+      ${bad ? '<span class="tag bad">现状无解，不可选</span>'
+        : (dualState.critical.has(i) ? '<span class="tag warn">关键 · 主备双通道</span>' : "")}
+    </label>`;
+  }).join("");
+  const inp = $("#dual-max-new");
+  if (document.activeElement !== inp) inp.value = String(dualState.maxNew);
+  $("#dual-hint").textContent = dualState.critical.size
+    ? `已勾选 ${dualState.critical.size} 条关键路由：系统将联合规划主 / 备通路并做逐一断点仿真。`
+    : "勾选至少一条关键路由后计算；非关键路由只要求终态可用。";
+  lastDualData = null;
+  $("#dual-results").innerHTML = "";
+}
+
+function toggleDualCritical(i, on) {
+  if (on) dualState.critical.add(i);
+  else dualState.critical.delete(i);
+  if (lastPlanData) renderDualPanel(lastPlanData, true);
+}
+
+async function runDualPath() {
+  const out = $("#dual-results");
+  if (!lastConfig) {
+    out.innerHTML = `<div class="banner warn">请先计算一次路由方案。</div>`;
+    return;
+  }
+  if (!dualState.critical.size) {
+    out.innerHTML = `<div class="banner warn">请至少勾选一条关键路由。</div>`;
+    return;
+  }
+  const maxRaw = $("#dual-max-new").value;
+  let maxNew = null;
+  if (maxRaw.trim() !== "") {
+    maxNew = Number(maxRaw);
+    if (!Number.isInteger(maxNew) || maxNew < 0) {
+      out.innerHTML = `<div class="banner err">最多新增跳线数必须是非负整数（或留空表示不限制）。</div>`;
+      return;
+    }
+  }
+  dualState.maxNew = maxNew ?? 4;
+  out.innerHTML = `<div class="banner">⏳ 正在联合搜索可同时安装的主 / 备通路（全部可通 → 跳线最少）…</div>`;
+  let data, status;
+  try {
+    const res = await fetch("/api/dual-path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        config: lastConfig,
+        redundancy: {
+          criticalRoutes: [...dualState.critical].sort((a, b) => a - b),
+          maxNewCables: maxNew,
+        },
+      }),
+    });
+    data = await res.json();
+    status = res.status;
+  } catch (e) {
+    out.innerHTML = `<div class="banner err">无法连接后端：${esc(e.message)}</div>`;
+    return;
+  }
+  if (status === 400) {
+    out.innerHTML = `<div class="banner err">双通道请求非法：${esc(errorMessage(data))}</div>`;
+    return;
+  }
+  lastDualData = data;
+  activeDualBreak = null;
+  if (status === 409) renderDualConflict(data);
+  else renderDualSuccess(data);
+}
+
+function branchBadge(br, label) {
+  if (!br) return "";
+  const cls = br.role === "primary" ? "dual-primary" : "dual-backup";
+  let state = br.audibleFinal
+    ? '<span class="tag ok">终态通声</span>'
+    : '<span class="tag warn">终态休眠 · 故障时自动恢复</span>';
+  const dormant = br.dormantNormalIds.length
+    ? `，休眠常态 第${br.dormantNormalIds.map((n) => n).join("、")}对`
+      + (br.overrideCableId ? `（拔除跳线 #${br.overrideCableId} 即恢复）` : "")
+    : "";
+  return `<div class="dual-branch ${cls}">
+    <div class="route-title"><span class="dual-role-tag ${cls}">${label}</span>
+      <span class="hint">跳线 ${br.cables.length ? br.cables.map((c) => `#${c}`).join("、") : "无"}
+      · 生效常态 第${br.liveNormalIds.length ? br.liveNormalIds.join("、") : "—"}对${dormant}</span>
+      ${state}</div>
+    ${chainHtml(br.chain)}</div>`;
+}
+
+function renderDualSuccess(data) {
+  let html = `<div class="banner ok">✅ 双通道规划完成：全部路由可通，<b>${data.criticalRoutes.length}</b> 条关键路由均有
+    资源互不重叠的主 / 备通路；最终安装 <b>${data.cableCount}</b> 根跳线
+    （输入顺序贪心基线 ${data.baselineCableCount} 根，新增 <b>${data.newCableCount}</b> 根）。</div>`;
+  if (data.redundancy.solverNote) {
+    html += `<div class="banner warn">⚠️ ${esc(data.redundancy.solverNote)}</div>`;
+  }
+  if (data.feedbackLoops.length) {
+    html += `<div class="banner warn">⚠️ 检测到 ${data.feedbackLoops.length} 个反馈环路（仅警告）：<ul class="loop-list">` +
+      data.feedbackLoops.map((l) => `<li>${l.map(esc).join(" → ")}</li>`).join("") + `</ul></div>`;
+  }
+
+  html += `<div class="audit-stat-row">
+    <span class="audit-stat"><b>${data.criticalRoutes.length}</b>关键路由</span>
+    <span class="audit-stat ok"><b>${data.cableCount}</b>最终跳线</span>
+    <span class="audit-stat ${data.newCableCount ? "warn" : "ok"}"><b>${data.newCableCount}</b>新增跳线</span>
+    <span class="audit-stat"><b>${data.baselineCableCount}</b>贪心基线</span>
+    <span class="audit-stat"><b>${data.failurePreview.length}</b>可演练断点</span>
+    <span class="audit-stat"><b>${data.redundancy.searchNodes}</b>搜索节点</span>
+  </div>`;
+
+  if (data.steps.length) {
+    html += `<div class="result-card"><h3>接线顺序（主备跳线一次全部安装）</h3><ol class="steps">` +
+      data.steps.map((s) => `<li>${esc(s)}</li>`).join("") + `</ol></div>`;
+  }
+  if (data.notes.length) {
+    html += `<div class="result-card"><h3>插头对常态连接的影响</h3><ul class="notes">` +
+      data.notes.map((n) => `<li>${esc(n)}</li>`).join("") + `</ul></div>`;
+  }
+
+  // 占用总表
+  const occ = data.occupancy;
+  html += `<div class="result-card"><h3>最终占用（跳线 / 常态的主备归属）</h3>
+    <table class="grid metrics"><thead><tr><th>跳线</th><th>两端插孔</th><th>归属</th><th>使用路由</th></tr></thead><tbody>` +
+    occ.cables.map((c) => `<tr>
+      <td><b>#${c.id}</b></td>
+      <td>${esc(c.fromJack)}（${esc(c.fromPort)}）↔ ${esc(c.toJack)}（${esc(c.toPort)}）</td>
+      <td><span class="dual-role-tag dual-${c.roleKind}">${esc(c.roleLabel)}</span></td>
+      <td>${c.users.map((u) => `路由${u.route + 1}·${({primary: "主", backup: "备", single: "非关键"})[u.role] || u.role}`).join("、")}</td>
+    </tr>`).join("") + `</tbody></table>`;
+  if (occ.normals.length) {
+    html += `<table class="grid metrics" style="margin-top:10px"><thead><tr>
+      <th>常态</th><th>终态</th><th>使用路由</th><th>说明</th></tr></thead><tbody>` +
+      occ.normals.map((n) => `<tr${n.dormant ? ' class="row-bad"' : ""}>
+        <td>第${n.pairId}对 · ${esc(n.modeLabel)}</td>
+        <td>${n.active ? '<span class="tag ok">生效</span>' : '<span class="tag warn">休眠</span>'}
+          ${n.halfMult ? '<span class="tag ok">半常态并送</span>' : ""}</td>
+        <td>${n.users.map((u) => `路由${u.route + 1}·${({primary: "主", backup: "备", single: "非关键"})[u.role] || u.role}·${u.state === "live" ? "生效" : "休眠"}`).join("、")}</td>
+        <td class="hint">${n.dormant && n.overrideCableId ? `拔除跳线 #${n.overrideCableId} 后恢复` : ""}</td>
+      </tr>`).join("") + `</tbody></table>`;
+  }
+  html += `</div>`;
+
+  // 每条路由主备链路
+  html += `<div class="result-card"><h3>主备逐段链路</h3>` + data.routes.map((r) => {
+    const head = r.critical
+      ? `<span class="dual-role-tag dual-primary">关键</span> 路由 ${r.index + 1}：`
+      : `<span class="dual-role-tag dual-single">非关键</span> 路由 ${r.index + 1}：`;
+    return `<div class="route-block"><div class="route-title">${head}
+      ${esc(r.source)} → ${esc(r.target)}</div>
+      ${branchBadge(r.primary, r.critical ? "主通路 primary" : "通路")}
+      ${r.backup ? branchBadge(r.backup, "备用通路 backup") : ""}</div>`;
+  }).join("") + `</div>`;
+
+  // 故障预览（点击断点高亮幸存通路）
+  html += `<div class="result-card"><h3>逐一断点后的幸存通路（点击任一断点查看）</h3>
+    <div class="dual-break-list" id="dual-break-list">` +
+    data.failurePreview.map((fp, i) => {
+      const allSurvive = fp.critical.every((c) => c.survivorRole);
+      return `<button class="rewire-step ${allSurvive ? "ok" : "bad"}" id="dual-break-btn-${i}"
+        onclick="selectDualBreak(${i})">
+        <span class="step-no">${fp.type === "cable" ? "拔跳线" : "切常态"} #${fp.id}</span>
+        <span class="step-title">${esc(fp.label)}</span>
+        <span class="step-prot">${fp.critical.map((c) => `<span class="prot-chip ${c.survivorRole ? "on" : "off"}">
+          路由${c.route + 1} ${c.survivorRole === "primary" ? "主✓" : c.survivorRole === "backup" ? "备✓接管" : "✗断"}</span>`).join("")}
+          ${fp.affectedCount ? `<span class="prot-chip off">非关键受影响 ${fp.affectedCount}</span>` : ""}</span>
+      </button>`;
+    }).join("") + `</div>
+    <div id="dual-break-detail"></div></div>`;
+
+  html += `<div class="result-card"><h3>主备双通道拓扑（点击上方断点预览故障）</h3>
+    <div class="audit-svg-wrap" id="dual-svg-wrap">${dualTopologySvg(data)}</div>
+    <div class="legend">
+      <span class="swatch" style="background:#4da3ff;border-color:#4da3ff"></span>主通路跳线
+      <span class="swatch" style="background:#c56cf0;border-color:#c56cf0"></span>备用通路跳线
+      <span class="swatch" style="background:#3ecf8e;border-color:#3ecf8e"></span>生效常态
+      <span class="swatch" style="background:#ffcf5c;border-color:#ffcf5c"></span>休眠常态（拔跳线恢复）/ 半常态并送
+      <span class="swatch" style="background:#8d96a3;border-color:#8d96a3"></span>非关键跳线</div>
+  </div>`;
+
+  $("#dual-results").innerHTML = html;
+  if (data.failurePreview.length) selectDualBreak(0);
+}
+
+function selectDualBreak(i) {
+  const data = lastDualData;
+  if (!data || !data.failurePreview[i]) return;
+  document.querySelectorAll("#dual-break-list .rewire-step").forEach((b, k) =>
+    b.classList.toggle("active", k === i));
+  activeDualBreak = i;
+  const fp = data.failurePreview[i];
+  let html = `<div class="step-detail-head"><b>断点：${esc(fp.label)}</b>
+    <span class="hint">（${fp.ports.map((p) => esc(p.jack)).join(" / ")}）</span></div>`;
+  html += `<div class="rewire-detail-cols">` +
+    fp.critical.map((c) => {
+      const r = data.routes[c.route];
+      if (!c.survivorRole) {
+        return `<div><h4>路由 ${c.route + 1}：${esc(r.source)} → ${esc(r.target)}</h4>
+          <span class="tag bad">✗ 主备均断（不应发生）</span></div>`;
+      }
+      const switched = c.switchedToBackup
+        ? '<span class="tag warn">主路断开 · 备用通路接管</span>'
+        : (c.survivorRole === "backup" ? '<span class="tag ok">备用通路在线</span>'
+          : '<span class="tag ok">主通路保持</span>');
+      return `<div><h4>路由 ${c.route + 1}：${esc(r.source)} → ${esc(r.target)} ${switched}</h4>
+        ${chainHtml(c.survivorChain)}</div>`;
+    }).join("") + `</div>`;
+  if (fp.affectedRoutes.length) {
+    html += `<h4>受影响的非关键路由：${fp.affectedRoutes.map((x) => `路由${x + 1}`).join("、")}</h4>`;
+  }
+  $("#dual-break-detail").innerHTML = html;
+  const wrap = $("#dual-svg-wrap");
+  if (wrap) wrap.innerHTML = dualTopologySvg(data);
+}
+
+function renderDualConflict(data) {
+  const err = data.error || {};
+  let html = "";
+  if (data.inconclusive) {
+    html += `<div class="banner warn">⚠️ 搜索达到节点 / 枚举上限，结论为 <b>inconclusive</b>：
+      尚未找到满足全部主备约束的规划，但未证明绝对无解。<b>未提交任何部分方案。</b></div>`;
+  } else {
+    html += `<div class="banner err">❌ 不存在满足全部关键路由单点断路保护的双通道规划：
+      穷尽主备通路组合与跳线预算后仍有关键路由找不到可同时安装、资源互不重叠的两条通路。
+      <b>不返回接线步骤，不提交部分方案。</b></div>`;
+  }
+  if (data.solverNote) html += `<div class="banner warn">⚠️ ${esc(data.solverNote)}</div>`;
+  html += `<div class="audit-stat-row">
+    <span class="audit-stat err"><b>${data.conflictBreakPoints.length}</b>冲突断点</span>
+    <span class="audit-stat warn"><b>${data.unsatisfiedRoutes.length}</b>未满足路由</span>
+    <span class="audit-stat"><b>${data.baselineCableCount}</b>贪心基线跳线</span>
+    <span class="audit-stat"><b>${data.searchNodes}</b>搜索节点</span>
+  </div>`;
+
+  if (data.conflictBreakPoints.length) {
+    html += `<div class="result-card"><h3>冲突断点（贪心单链路上未被备份的单点）</h3>
+      <table class="grid"><thead><tr><th>类型</th><th>断点</th><th>断点端口</th><th>涉及关键路由</th></tr></thead><tbody>` +
+      data.conflictBreakPoints.map((bp) => `<tr>
+        <td>${bp.type === "cable" ? '<span class="tag bad">跳线</span>' : '<span class="tag warn">常态</span>'}</td>
+        <td>${esc(bp.label)}</td>
+        <td>${bp.ports.map((p) => `${esc(p.jack)}（${esc(p.port || "?")}）`).join("、")}</td>
+        <td>${bp.criticalRoutes.map((r) => `路由 ${r + 1}`).join("、")}</td>
+      </tr>`).join("") + `</tbody></table></div>`;
+  }
+
+  if (data.occupiedJacks.length) {
+    html += `<div class="result-card"><h3>占用插孔（贪心对照）</h3><p class="hint">` +
+      data.occupiedJacks.map((j) => `${esc(j.jack)}（${esc(j.port || "?")}）← 跳线 #${j.cableId}`).join("；")
+      + `</p></div>`;
+  }
+
+  html += `<div class="result-card"><h3>未满足路由</h3>` +
+    data.unsatisfiedRoutes.map((u) => `<div class="route-block">
+      <div class="route-title">${u.critical ? '<span class="dual-role-tag dual-primary">关键</span>'
+        : '<span class="dual-role-tag dual-single">非关键</span>'} 路由 ${u.index + 1}：
+      ${esc(u.source)} → ${esc(u.target)}
+      <span class="tag bad">${u.status === "unroutable" ? "不可路由" : "单点故障无备份"}</span></div>
+      <ul class="conflict-reasons">${u.reasons.map((x) => `<li>${esc(x)}</li>`).join("")}</ul>
+      ${u.ports && u.ports.length ? `<div class="conflict-ports">冲突端口：` +
+        u.ports.map((p) => `${esc(p.jack)}（${esc(p.port || "?")}）`).join("、") + `</div>` : ""}
+    </div>`).join("") + `</div>`;
+
+  if (data.reasonDigest && data.reasonDigest.length) {
+    html += `<div class="result-card"><h3>终止状态候选主备组合失败原因</h3><ul class="notes">` +
+      data.reasonDigest.map((d) => `<li>路由 ${d.route + 1}：${esc(d.message)}
+        <span class="hint">（${d.count} 种候选组合）</span></li>`).join("") + `</ul></div>`;
+  }
+
+  html += `<div class="result-card"><h3>贪心对照面板（仅分析，不是可施工方案）</h3>
+    ${panelSvg(data.baseline.pairs, data.baseline.cables)}</div>`;
+  $("#dual-results").innerHTML = html;
+}
+
+/* ---- 主备双通道拓扑 SVG ---- */
+
+const DUAL_ROLE_COLORS = {
+  primary: "#4da3ff", backup: "#c56cf0", shared: "#ffcf5c", single: "#8d96a3",
+};
+
+function dualCableRole(data, cableId) {
+  const c = data.occupancy.cables.find((x) => x.id === cableId);
+  return c ? c.roleKind : "single";
+}
+
+function dualTopologySvg(data) {
+  const pairs = data.pairs;
+  if (!pairs.length) return "";
+  const cables = data.cables;
+  const colW = 104, x0 = 64, topY = 70, botY = 140, height = 330;
+  const width = x0 * 2 + colW * (pairs.length - 1);
+  const pos = {};
+  pairs.forEach((p, i) => {
+    pos[p.topJack] = { x: x0 + i * colW, y: topY };
+    pos[p.bottomJack] = { x: x0 + i * colW, y: botY };
+  });
+  const occCable = Object.fromEntries(data.occupancy.cables.map((c) => [c.id, c]));
+  const dormantIds = new Set((data.occupancy.normals || []).filter((n) => n.dormant).map((n) => n.pairId));
+  const multIds = new Set((data.occupancy.normals || []).filter((n) => n.halfMult).map((n) => n.pairId));
+
+  // 选中的断点
+  const fp = activeDualBreak != null ? data.failurePreview[activeDualBreak] : null;
+  const brokenJacks = new Set();
+  const brokenCableIds = new Set();
+  const brokenNormalIds = new Set();
+  let survivorEdges = new Set();
+  if (fp) {
+    fp.ports.forEach((p) => brokenJacks.add(p.jack));
+    if (fp.type === "cable") brokenCableIds.add(fp.id);
+    else brokenNormalIds.add(fp.id);
+    for (const c of fp.critical) {
+      if (c.survivorChain) {
+        for (let k = 0; k < c.survivorChain.length; k++) {
+          const it = c.survivorChain[k];
+          if (it.kind === "edge" && it.type === "cable" && it.cableId != null) {
+            survivorEdges.add(`cable:${it.cableId}`);
+          }
+        }
+      }
+    }
+  }
+
+  let s = `<svg id="dual-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
+  s += `<rect x="8" y="32" width="${width - 16}" height="150" rx="10" fill="#12151a" stroke="#2e3542"/>`;
+  s += `<text x="20" y="24" fill="#9aa4b2" font-size="12">关键路由主备双通道拓扑` +
+    (fp ? ` · 故障预览：${esc(fp.label)}` : "（常态 / 跳线最终占用）") + `</text>`;
+
+  // 常态
+  for (const p of pairs) {
+    if (p.mode === "through" || !p.topPort || !p.bottomPort) continue;
+    const t = pos[p.topJack], b = pos[p.bottomJack];
+    let col, w = 3, dash = "", opacity = .9;
+    if (brokenNormalIds.has(p.id)) {
+      col = "#ff6b6b"; w = 6;
+    } else if (dormantIds.has(p.id)) {
+      col = "#ffcf5c"; dash = ' stroke-dasharray="6,5"'; opacity = .8;
+    } else if (p.normalActive) {
+      col = "#3ecf8e";
+    } else {
+      col = "#5a6270"; opacity = .4;
+    }
+    s += `<line x1="${t.x - 18}" y1="${t.y}" x2="${b.x - 18}" y2="${b.y}"
+      stroke="${col}" stroke-width="${w}"${dash} opacity="${opacity}"/>`;
+    if (multIds.has(p.id)) {
+      s += `<g><circle cx="${t.x + 13}" cy="${t.y - 12}" r="7" fill="#ffcf5c" stroke="#5a4a10"/>
+        <text x="${t.x + 13}" y="${t.y - 8}" fill="#2a2100" font-size="9" text-anchor="middle" font-weight="bold">并</text></g>`;
+    }
+  }
+
+  // 跳线
+  cables.forEach((c) => {
+    const a = pos[c.fromJack], b = pos[c.toJack];
+    if (!a || !b) return;
+    const role = dualCableRole(data, c.id);
+    const broken = brokenCableIds.has(c.id);
+    const survivor = survivorEdges.has(`cable:${c.id}`);
+    const color = broken ? "#ff6b6b" : DUAL_ROLE_COLORS[role] || CABLE_COLORS[c.id % CABLE_COLORS.length];
+    const depth = 64 + Math.abs(a.x - b.x) * 0.3;
+    const mx = (a.x + b.x) / 2, my = botY + depth;
+    let dash = "";
+    if (broken) dash = ' stroke-dasharray="8,6"';
+    s += `<path d="M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}" fill="none"
+      stroke="${color}" stroke-width="${survivor ? 6 : 3.2}"${dash}/>`;
+    s += `<text x="${mx}" y="${my * 0.62}" fill="${color}" font-size="12"
+      text-anchor="middle" font-weight="bold">${broken ? "✕" : "#"}${c.id}</text>`;
+  });
+
+  // 插孔
+  for (const p of pairs) {
+    for (const [jack, port, dy] of [[p.topJack, p.topPort, -15], [p.bottomJack, p.bottomPort, 26]]) {
+      if (!pos[jack]) continue;
+      const { x, y } = pos[jack];
+      const owner = cables.find((c) => c.fromJack === jack || c.toJack === jack);
+      let fill = "#1d222b", stroke = "#9aa4b2", sw = 1.5;
+      if (owner) {
+        const role = brokenCableIds.has(owner.id) ? null : dualCableRole(data, owner.id);
+        fill = role ? DUAL_ROLE_COLORS[role] : "#3a2222";
+      }
+      if (brokenJacks.has(jack)) { stroke = "#ff6b6b"; sw = 3.5; }
+      s += `<circle cx="${x}" cy="${y}" r="9" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>`;
+      s += `<text x="${x}" y="${y + dy}" fill="#9aa4b2" font-size="10" text-anchor="middle">${esc(port || "—")}</text>`;
+      s += `<text x="${x + 14}" y="${y + 4}" fill="#e6e9ef" font-size="10">${esc(jack)}</text>`;
+    }
+    s += `<text x="${pos[p.topJack].x}" y="${botY + 42}" fill="#9aa4b2" font-size="10"
+      text-anchor="middle">第${p.id}对 · ${esc(p.modeLabel)}</text>`;
+  }
   s += `</svg>`;
   return s;
 }

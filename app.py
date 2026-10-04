@@ -5,6 +5,8 @@ from flask import Flask, jsonify, request, send_from_directory
 from audit import audit_signals
 from isolation import IsolationConflict, IsolationError, plan_isolation
 from layout import solve_layout
+from redundancy import (RedundancyConflict, RedundancyError,
+                        plan_redundancy)
 from rewire import RewireError, SeamlessConflict, seamless_rewire
 from solver import (EXAMPLES, ConfigError, FaultTargetError,
                     fault_assessment, solve)
@@ -146,6 +148,34 @@ def seamless_rewire_drill():
         # 不存在保持保护路由连续通声的顺序：结构化阻塞原因（不产生步骤）
         return _structured_error(exc, 409)
     except RewireError as exc:
+        return _structured_error(exc, 400)
+    except ConfigError as exc:
+        return _structured_error(exc, 400)
+    return jsonify(result)
+
+
+@app.post("/api/dual-path")
+def dual_path():
+    """关键路由双通道规划：为关键路由联合选择可同时安装的主/备通路。"""
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "请求体必须是 JSON 对象"}}), 400
+    config = body.get("config")
+    if not isinstance(config, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "缺少 config 配置对象"}}), 400
+    redundancy = body.get("redundancy", {})
+    if not isinstance(redundancy, dict):
+        return jsonify({"ok": False, "error": {"code": "BAD_REQUEST",
+                                               "message": "redundancy 必须是 JSON 对象"}}), 400
+    try:
+        result = plan_redundancy(config, redundancy)
+    except RedundancyConflict as exc:
+        # 穷尽搜索仍无满足主备单点保护的完整规划：冲突断点 / 占用插孔 /
+        # 未满足路由（不返回接线步骤，不提交部分方案）
+        return _structured_error(exc, 409)
+    except RedundancyError as exc:
         return _structured_error(exc, 400)
     except ConfigError as exc:
         return _structured_error(exc, 400)

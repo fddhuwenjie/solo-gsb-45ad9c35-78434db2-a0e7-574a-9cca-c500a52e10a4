@@ -240,3 +240,25 @@ footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px
 }
 .group-overview-row:last-child { border-bottom: none; }
 #isolation-results { margin-top: 16px; }
+
+/* ---------------- 关键路由双通道规划 ---------------- */
+.dual-budget { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.dual-budget input { width: 80px; }
+.dual-branch {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 12px; margin: 8px 0; background: #171c25;
+}
+.dual-branch.dual-primary { border-left: 4px solid #4da3ff; }
+.dual-branch.dual-backup { border-left: 4px solid #c56cf0; }
+.dual-role-tag {
+  display: inline-block; font-size: 12px; font-weight: 600;
+  padding: 2px 10px; border-radius: 10px; color: #0b1521; white-space: nowrap;
+  margin-right: 6px;
+}
+.dual-role-tag.dual-primary { background: #4da3ff; }
+.dual-role-tag.dual-backup { background: #c56cf0; }
+.dual-role-tag.dual-shared { background: #ffcf5c; }
+.dual-role-tag.dual-single { background: #8d96a3; }
+.dual-break-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0 14px; }
+.dual-break-list .rewire-step { border-left-width: 4px; }
+#dual-results { margin-top: 16px; }

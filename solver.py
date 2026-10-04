@@ -930,4 +930,38 @@ EXAMPLES = {
             },
         },
     },
+    "redundancy": {
+        "label": "关键路由双通道演示（主备抗单点断路）",
+        "config": {
+            "devices": [
+                {"name": "VOX", "inputs": [], "outputs": ["out"]},
+                {"name": "PRE", "inputs": ["in"], "outputs": ["out"]},
+                {"name": "REC", "inputs": ["in1", "in2"], "outputs": []},
+                {"name": "AUX", "inputs": [], "outputs": ["out"]},
+                {"name": "MON", "inputs": ["in"], "outputs": []},
+                {"name": "CLK", "inputs": [], "outputs": ["out"]},
+                {"name": "TBC", "inputs": ["in"], "outputs": []},
+            ],
+            "pairs": [
+                {"id": 1, "top": "VOX.out", "bottom": "PRE.in", "mode": "half"},
+                {"id": 2, "top": "PRE.out", "bottom": "REC.in1", "mode": "half"},
+                {"id": 3, "top": None, "bottom": "REC.in2", "mode": "through"},
+                {"id": 4, "top": "AUX.out", "bottom": "MON.in", "mode": "half"},
+                {"id": 5, "top": None, "bottom": None, "mode": "through"},
+                {"id": 6, "top": "CLK.out", "bottom": "TBC.in", "mode": "through"},
+            ],
+            "routes": [
+                {"source": "VOX.out", "target": "REC.in1"},
+                {"source": "AUX.out", "target": "MON.in"},
+                {"source": "CLK.out", "target": "TBC.in"},
+            ],
+            # 随示例一起载入的双通道声明（/api/dual-path 才使用）：
+            # 路由 1 关键（半常态上插孔并送 + 休眠常态，+1 跳线实现主备）；
+            # maxNewCables 为允许在贪心 2 根跳线之外新增的跳线数上限
+            "redundancy": {
+                "criticalRoutes": [0],
+                "maxNewCables": 4,
+            },
+        },
+    },
 }
